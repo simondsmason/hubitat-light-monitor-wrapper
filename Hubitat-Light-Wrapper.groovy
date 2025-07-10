@@ -13,6 +13,7 @@
  *  1.03 - Added connectivity issue detection and handling to prevent monitoring during device connectivity problems
  *  1.04 - Enhanced connectivity detection to work with different device types (WiFi/Hue, Zigbee, Z-Wave) and added detailed device diagnostics
  *  1.05 - Optimized default settings for environments with connectivity issues (30s/30s/240s/60s intervals)
+ *  1.06 - Fixed infinite loop issue where app was monitoring its own refresh commands by filtering out digital events and adding recent command detection
  *
  */
 
@@ -136,10 +137,23 @@ def lightSwitchHandler(evt) {
         return
     }
     
-    // Check cooldown period to prevent rapid retry loops
+    // Check if this is a digital event that might be a response to our own refresh command
+    // Digital events often indicate the device acknowledging a command rather than a physical state change
+    if (evt.source == "digital" || evt.source == "DIGITAL") {
+        logDebug("Ignoring digital event - likely response to our own command - Device: ${deviceName}, State: ${newState}")
+        return
+    }
+    
+    // Check if we recently sent a command to this device (within the last 10 seconds)
     def lastCommandTime = state.lastCommandTime[deviceId] ?: 0
     def timeSinceLastCommand = (now() - lastCommandTime) / 1000
     
+    if (timeSinceLastCommand < 10) {
+        logDebug("Ignoring event due to recent command - Device: ${deviceName}, Time since last command: ${timeSinceLastCommand.toInteger()}s")
+        return
+    }
+    
+    // Check cooldown period to prevent rapid retry loops
     if (timeSinceLastCommand < cooldownPeriod) {
         logDebug("Ignoring event due to cooldown period - Device: ${deviceName}, Time since last command: ${timeSinceLastCommand.toInteger()}s, Cooldown: ${cooldownPeriod}s")
         return
@@ -591,4 +605,22 @@ def startMonitoring(device, desiredState) {
     runIn(commandTimeout, "timeoutCheck", [data: [deviceId: deviceId]])
     
     return true
+}
+
+// Function to manually clear stuck monitoring states
+def clearStuckMonitoring() {
+    logInfo("Attempting to clear stuck monitoring states...")
+    def stuckDevices = state.monitoringState.findAll { it.value.waitingForRefresh || it.value.refreshSent }
+    if (stuckDevices.size() > 0) {
+        logWarn("Found ${stuckDevices.size()} devices in a stuck state. Attempting to clear them.")
+        stuckDevices.each { deviceId, monitorData ->
+            def deviceName = monitorData.deviceName ?: "Unknown Device"
+            logWarn("Clearing stuck monitoring state for device ${deviceName} (ID: ${deviceId})")
+            state.monitoringState.remove(deviceId)
+            logInfo("Monitoring state for device ${deviceName} (ID: ${deviceId}) cleared.")
+        }
+        logInfo("Successfully cleared ${stuckDevices.size()} stuck monitoring states.")
+    } else {
+        logInfo("No devices found in a stuck state.")
+    }
 }

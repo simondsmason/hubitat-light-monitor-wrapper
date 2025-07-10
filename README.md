@@ -85,6 +85,7 @@ The default settings are optimized for environments with connectivity issues:
 - **1.03** - Added connectivity issue detection and handling to prevent monitoring during device connectivity problems
 - **1.04** - Enhanced connectivity detection to work with different device types (WiFi/Hue, Zigbee, Z-Wave) and added detailed device diagnostics
 - **1.05** - Optimized default settings for environments with connectivity issues (30s/30s/240s/60s intervals)
+- **1.06** - Fixed infinite loop issue where app was monitoring its own refresh commands by filtering out digital events and adding recent command detection
 
 ## Troubleshooting
 
@@ -108,6 +109,15 @@ The default settings are optimized for environments with connectivity issues:
 2. Increase the check interval to reduce polling frequency
 3. Disable debug logging if not needed
 4. Check for network congestion or WiFi issues
+
+### Infinite Loop Issues (Fixed in v1.06+)
+
+If you experience continuous refresh commands or monitoring loops:
+
+1. **Update to version 1.06 or later** - This version includes fixes for infinite loops
+2. **Restart the app** - Go to app settings and click "Done" to clear stuck monitoring states
+3. **Use the clear function** - Run `app.clearStuckMonitoring()` in the Hubitat console if needed
+4. **Check for digital events** - The app now properly filters out digital responses to its own commands
 
 ## Contributing
 
