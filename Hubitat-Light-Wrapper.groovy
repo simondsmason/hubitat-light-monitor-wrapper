@@ -14,6 +14,8 @@
  *  1.04 - Enhanced connectivity detection to work with different device types (WiFi/Hue, Zigbee, Z-Wave) and added detailed device diagnostics
  *  1.05 - Optimized default settings for environments with connectivity issues (30s/30s/240s/60s intervals)
  *  1.06 - Fixed infinite loop issue where app was monitoring its own refresh commands by filtering out digital events and adding recent command detection
+ *  1.07 - Event handler now only ignores events within 10 seconds of the wrapper's own command, monitors all other events (including digital/app-command/mesh), and enhanced debug logging for event diagnosis
+ *  1.08 - Added force-clear logic: if a device is already being monitored when a new event is received, the app forcefully clears its monitoring state, logs an error, and proceeds to monitor the new event. This ensures the app always monitors the latest event for each device and never gets stuck on an old state
  *
  */
 
@@ -127,31 +129,93 @@ def logError(msg) {
 }
 
 def lightSwitchHandler(evt) {
+    // EXTRA DEBUG: Output all devices currently in monitoringState
+    if (state.monitoringState && state.monitoringState.size() > 0) {
+        def stuckDevices = state.monitoringState.collect { k, v -> "${v.deviceName ?: 'Unknown'} (ID: ${k})" }.join(", ")
+        logDebug("Devices currently in monitoringState: ${stuckDevices}")
+    } else {
+        logDebug("No devices currently in monitoringState.")
+    }
+    
     def deviceId = evt.deviceId.toString()
     def deviceName = evt.displayName
     def newState = evt.value
-    
-    // Check if this event was triggered by our own app (to prevent monitoring external events)
-    if (evt.source == "APP_COMMAND" || evt.source == "COMMAND") {
-        logDebug("Ignoring event from our own app command - Device: ${deviceName}, State: ${newState}")
-        return
+
+    // FORCE-CLEAR LOGIC: If device is already being monitored, clear it and log error
+    if (state.monitoringState.containsKey(deviceId)) {
+        logError("Device ${deviceName} (ID: ${deviceId}) was stuck in monitoringState. Forcibly clearing before starting new monitoring cycle.")
+        state.monitoringState.remove(deviceId)
+        if (state.monitoringState.containsKey(deviceId)) {
+            logError("Device ${deviceName} (ID: ${deviceId}) could not be removed from monitoringState. Manual intervention may be required.")
+        }
     }
     
-    // Check if this is a digital event that might be a response to our own refresh command
-    // Digital events often indicate the device acknowledging a command rather than a physical state change
-    if (evt.source == "digital" || evt.source == "DIGITAL") {
-        logDebug("Ignoring digital event - likely response to our own command - Device: ${deviceName}, State: ${newState}")
-        return
-    }
+    // EXTRA DEBUG: Log the full monitoring state map
+    logDebug("Current monitoringState map: ${state.monitoringState}")
+    
+    // Enhanced logging for debugging event sources
+    logDebug("EVENT RECEIVED - Device: ${deviceName}, State: ${newState}, Source: ${evt.source}, Type: ${evt.type}, Description: ${evt.description}, Event: ${evt.inspect()}")
     
     // Check if we recently sent a command to this device (within the last 10 seconds)
     def lastCommandTime = state.lastCommandTime[deviceId] ?: 0
     def timeSinceLastCommand = (now() - lastCommandTime) / 1000
+    logDebug("Last command time for device ${deviceName}: ${lastCommandTime} (${new Date(lastCommandTime).format('yyyy-MM-dd HH:mm:ss')})")
+    logDebug("Time since last command for device ${deviceName}: ${timeSinceLastCommand}s")
     
     if (timeSinceLastCommand < 10) {
         logDebug("Ignoring event due to recent command - Device: ${deviceName}, Time since last command: ${timeSinceLastCommand.toInteger()}s")
         return
     }
+    
+    // Enhanced digital event detection - check multiple indicators
+    def isDigitalEvent = false
+    
+    // Check event source
+    if (evt.source == "digital" || evt.source == "DIGITAL") {
+        isDigitalEvent = true
+        logDebug("Digital event detected by source - Device: ${deviceName}, Source: ${evt.source}")
+    }
+    
+    // Check event description for digital indicators
+    if (evt.description && (evt.description.contains("(digital)") || evt.description.contains("[digital]"))) {
+        isDigitalEvent = true
+        logDebug("Digital event detected by description - Device: ${deviceName}, Description: ${evt.description}")
+    }
+    
+    // Check if this is a command response rather than a state change
+    if (evt.type == "command" || evt.type == "COMMAND") {
+        isDigitalEvent = true
+        logDebug("Digital event detected by type - Device: ${deviceName}, Type: ${evt.type}")
+    }
+    
+    // Enhanced detection for light group member events
+    if (evt.description && evt.description.contains("was turned")) {
+        isDigitalEvent = true
+        logDebug("Light group member event detected - Device: ${deviceName}, Description: ${evt.description}")
+    }
+    
+    // Additional check for the specific pattern seen in your logs
+    if (evt.description && evt.description.contains("switch was turned") && evt.description.contains("(digital)")) {
+        isDigitalEvent = true
+        logDebug("Individual light controlled by group detected - Device: ${deviceName}, Description: ${evt.description}")
+    }
+    
+    // Check if device is part of a light group (additional context)
+    def device = lightSwitches.find { it.id.toString() == deviceId }
+    if (device) {
+        try {
+            def deviceType = device.getTypeName()
+            logDebug("Device type for ${deviceName}: ${deviceType}")
+            if (deviceType && deviceType.contains("Group")) {
+                logDebug("Device ${deviceName} appears to be a light group member")
+            }
+        } catch (Exception e) {
+            logDebug("Could not determine device type for ${deviceName}: ${e.message}")
+        }
+    }
+    
+    // We no longer ignore digital/app-command events except for our own recent commands
+    // All other events (including digital) are monitored
     
     // Check cooldown period to prevent rapid retry loops
     if (timeSinceLastCommand < cooldownPeriod) {
@@ -161,12 +225,13 @@ def lightSwitchHandler(evt) {
     
     // Check if we're already monitoring this device
     if (state.monitoringState.containsKey(deviceId)) {
-        logDebug("Already monitoring device ${deviceName} - ignoring new event")
+        logDebug("Already monitoring device ${deviceName} - ignoring new event. Current monitoringState: ${state.monitoringState}")
         return
     }
     
     // Always log when monitoring starts, regardless of debug mode
     log.info "${app.name}: MONITORING STARTED - Light ${deviceName} (ID: ${deviceId}) changing to ${newState} at ${new Date().format('yyyy-MM-dd HH:mm:ss')}"
+    logDebug("Adding device ${deviceName} (ID: ${deviceId}) to monitoringState.")
     
     // Verify the device exists in our list - first with direct check
     def deviceExists = lightSwitches.find { it.id.toString() == deviceId }
@@ -184,11 +249,11 @@ def lightSwitchHandler(evt) {
         } else {
             // Try to recover by checking all devices
             def foundDevice = false
-            lightSwitches.each { device ->
-                logDebug("Checking device: ${device.id} vs event ${deviceId}")
-                if (device.id.toString() == deviceId) {
+            lightSwitches.each { checkDevice ->
+                logDebug("Checking device: ${checkDevice.id} vs event ${deviceId}")
+                if (checkDevice.id.toString() == deviceId) {
                     foundDevice = true
-                    deviceExists = device
+                    deviceExists = checkDevice
                 }
             }
             
@@ -234,8 +299,7 @@ def lightSwitchHandler(evt) {
         refreshSent: false,
         externalEvent: true // Mark this as an external event
     ]
-    
-    logDebug("Monitoring state initialized: ${state.monitoringState[deviceId]}")
+    logDebug("Device ${deviceName} (ID: ${deviceId}) added to monitoringState. New monitoringState: ${state.monitoringState}")
     
     // Wait for the initial checkInterval before starting checks to give device time to update
     logDebug("Scheduling initial check for device ${deviceName} in ${checkInterval} seconds")
@@ -287,6 +351,7 @@ def startRefreshProcess(data) {
         if (monitorData.checkCount >= maxRetries / 2) {
             logWarn("MONITORING ABANDONED - Could not access device ${deviceName} after multiple attempts")
             state.monitoringState.remove(deviceId)
+            logDebug("Device ${deviceName} (ID: ${deviceId}) removed from monitoringState. New monitoringState: ${state.monitoringState}")
         } else {
             // Increase check count and try again
             monitorData.checkCount = monitorData.checkCount + 1
@@ -362,6 +427,7 @@ def checkLightStatus(data) {
         if (monitorData.checkCount >= maxRetries / 2) {
             logWarn("MONITORING ABANDONED - Could not access device ${deviceName} after multiple attempts")
             state.monitoringState.remove(deviceId)
+            logDebug("Device ${deviceName} (ID: ${deviceId}) removed from monitoringState. New monitoringState: ${state.monitoringState}")
         } else {
             // Increase check count and try again
             monitorData.checkCount = monitorData.checkCount + 1
@@ -407,6 +473,7 @@ def checkLightStatus(data) {
         logInfo("MONITORING COMPLETED - Light ${deviceName} successfully changed to ${desiredState} after ${elapsedTime.toInteger()} seconds and ${monitorData.checkCount} retries")
         logDebug("Removing monitoring state for device ${deviceName}")
         state.monitoringState.remove(deviceId)
+        logDebug("Device ${deviceName} (ID: ${deviceId}) removed from monitoringState. New monitoringState: ${state.monitoringState}")
     } else {
         // Check if we've reached max retries
         if (monitorData.checkCount >= maxRetries) {
@@ -428,6 +495,7 @@ def checkLightStatus(data) {
             
             logDebug("Removing monitoring state for device ${deviceName}")
             state.monitoringState.remove(deviceId)
+            logDebug("Device ${deviceName} (ID: ${deviceId}) removed from monitoringState. New monitoringState: ${state.monitoringState}")
         } else {
             // Increment retry count and try again
             monitorData.checkCount = monitorData.checkCount + 1
@@ -518,6 +586,7 @@ def timeoutCheck(data) {
         // Clean up monitoring state for this device
         logDebug("Removing monitoring state for device ${deviceName} due to timeout")
         state.monitoringState.remove(deviceId)
+        logDebug("Device ${deviceName} (ID: ${deviceId}) removed from monitoringState. New monitoringState: ${state.monitoringState}")
     } else {
         logDebug("Timeout check passed - device ${deviceName} is still being actively monitored")
     }
@@ -623,4 +692,344 @@ def clearStuckMonitoring() {
     } else {
         logInfo("No devices found in a stuck state.")
     }
+}
+
+// Function to check light status without starting monitoring (useful for rule expiration checks)
+def checkLightStatusOnly(device) {
+    if (!device) {
+        logError("checkLightStatusOnly called with null device")
+        return null
+    }
+    
+    def deviceName = device.displayName
+    def deviceId = device.id.toString()
+    
+    logDebug("Checking status only for device ${deviceName} (ID: ${deviceId})")
+    
+    // Send refresh to get accurate state
+    try {
+        device.refresh()
+        logDebug("Sent refresh command to ${deviceName}")
+        
+        // Wait a moment for the refresh to complete
+        pauseExecution(2000)
+        
+        // Get current state
+        def currentState = device.currentValue("switch")
+        logInfo("Light ${deviceName} current state: ${currentState ?: 'Unknown'}")
+        
+        return currentState
+        
+    } catch (Exception e) {
+        logError("Error checking status for device ${deviceName}: ${e.message}")
+        return null
+    }
+}
+
+// Function to check multiple lights at once
+def checkMultipleLightStatus(devices) {
+    if (!devices || devices.size() == 0) {
+        logError("checkMultipleLightStatus called with no devices")
+        return [:]
+    }
+    
+    def results = [:]
+    
+    devices.each { device ->
+        def status = checkLightStatusOnly(device)
+        results[device.displayName] = status
+    }
+    
+    logInfo("Multiple light status check results: ${results}")
+    return results
+}
+
+// Function to check if specific lights are off (useful for rule expiration)
+def checkIfLightsAreOff(devices) {
+    if (!devices || devices.size() == 0) {
+        logError("checkIfLightsAreOff called with no devices")
+        return [:]
+    }
+    
+    def results = [:]
+    def allOff = true
+    
+    devices.each { device ->
+        def status = checkLightStatusOnly(device)
+        def isOff = (status == "off")
+        results[device.displayName] = [status: status, isOff: isOff]
+        
+        if (!isOff) {
+            allOff = false
+        }
+    }
+    
+    logInfo("Light off check results: ${results}")
+    logInfo("All lights off: ${allOff}")
+    
+    return [results: results, allOff: allOff]
+}
+
+// Function to turn off multiple lights and monitor them (useful for rule expiration)
+def turnOffLightsAndMonitor(devices) {
+    if (!devices || devices.size() == 0) {
+        logError("turnOffLightsAndMonitor called with no devices")
+        return false
+    }
+    
+    logInfo("Turning off ${devices.size()} lights and starting monitoring")
+    
+    def successCount = 0
+    devices.each { device ->
+        def success = startMonitoring(device, "off")
+        if (success) {
+            successCount++
+        }
+    }
+    
+    logInfo("Successfully started monitoring for ${successCount} out of ${devices.size()} lights")
+    return successCount == devices.size()
+}
+
+// Function to get current monitoring status for all devices
+def getMonitoringStatus() {
+    def status = [:]
+    
+    if (state.monitoringState) {
+        state.monitoringState.each { deviceId, monitorData ->
+            status[deviceId] = [
+                deviceName: monitorData.deviceName,
+                desiredState: monitorData.desiredState,
+                checkCount: monitorData.checkCount,
+                refreshCount: monitorData.refreshCount,
+                startTime: monitorData.startTime,
+                lastCheck: monitorData.lastCheck,
+                waitingForRefresh: monitorData.waitingForRefresh,
+                externalEvent: monitorData.externalEvent
+            ]
+        }
+    }
+    
+    logDebug("Current monitoring status: ${status}")
+    return status
+}
+
+// Function to handle light group monitoring
+def monitorLightGroup(lightGroup, desiredState) {
+    if (!lightGroup || !desiredState) {
+        logError("monitorLightGroup called with invalid parameters - lightGroup: ${lightGroup}, desiredState: ${desiredState}")
+        return false
+    }
+    
+    def groupName = lightGroup.displayName
+    logInfo("Starting light group monitoring for ${groupName} to ${desiredState}")
+    
+    try {
+        // Get the member devices of the light group
+        def memberDevices = lightGroup.getMembers()
+        logDebug("Light group ${groupName} has ${memberDevices.size()} member devices")
+        
+        if (memberDevices.size() == 0) {
+            logWarn("Light group ${groupName} has no member devices")
+            return false
+        }
+        
+        // Send command to the light group
+        if (desiredState == "on") {
+            lightGroup.on()
+            logDebug("Sent ON command to light group ${groupName}")
+        } else {
+            lightGroup.off()
+            logDebug("Sent OFF command to light group ${groupName}")
+        }
+        
+        // Track the command time for cooldown
+        def groupId = lightGroup.id.toString()
+        state.lastCommandTime[groupId] = now()
+        
+        // Monitor individual member devices instead of the group itself
+        def successCount = 0
+        memberDevices.each { memberDevice ->
+            // Only monitor devices that are in our configured list
+            if (lightSwitches.find { it.id.toString() == memberDevice.id.toString() }) {
+                def success = startMonitoring(memberDevice, desiredState)
+                if (success) {
+                    successCount++
+                }
+            } else {
+                logDebug("Member device ${memberDevice.displayName} not in configured monitoring list - skipping")
+            }
+        }
+        
+        logInfo("Successfully started monitoring for ${successCount} out of ${memberDevices.size()} member devices in group ${groupName}")
+        return successCount > 0
+        
+    } catch (Exception e) {
+        logError("Error monitoring light group ${groupName}: ${e.message}")
+        return false
+    }
+}
+
+// Function to check light group status
+def checkLightGroupStatus(lightGroup) {
+    if (!lightGroup) {
+        logError("checkLightGroupStatus called with null light group")
+        return null
+    }
+    
+    def groupName = lightGroup.displayName
+    logDebug("Checking status for light group ${groupName}")
+    
+    try {
+        // Get member devices
+        def memberDevices = lightGroup.getMembers()
+        logDebug("Light group ${groupName} has ${memberDevices.size()} member devices")
+        
+        def results = [:]
+        def allInDesiredState = true
+        def desiredState = null
+        
+        // Check each member device
+        memberDevices.each { memberDevice ->
+            def status = checkLightStatusOnly(memberDevice)
+            results[memberDevice.displayName] = status
+            
+            // Determine desired state from first device (they should all be the same)
+            if (desiredState == null) {
+                desiredState = status
+            }
+            
+            // Check if all devices are in the same state
+            if (status != desiredState) {
+                allInDesiredState = false
+            }
+        }
+        
+        logInfo("Light group ${groupName} status check results: ${results}")
+        logInfo("All members in same state: ${allInDesiredState}")
+        
+        return [results: results, allInDesiredState: allInDesiredState, groupState: desiredState]
+        
+    } catch (Exception e) {
+        logError("Error checking light group status for ${groupName}: ${e.message}")
+        return null
+    }
+}
+
+// Function to turn off light group and monitor members
+def turnOffLightGroupAndMonitor(lightGroup) {
+    return monitorLightGroup(lightGroup, "off")
+}
+
+// Function to turn on light group and monitor members
+def turnOnLightGroupAndMonitor(lightGroup) {
+    return monitorLightGroup(lightGroup, "on")
+}
+
+// Function to handle individual lights that are controlled by light groups
+def monitorIndividualLightsControlledByGroup(devices, desiredState) {
+    if (!devices || devices.size() == 0 || !desiredState) {
+        logError("monitorIndividualLightsControlledByGroup called with invalid parameters")
+        return false
+    }
+    
+    logInfo("Starting monitoring for ${devices.size()} individual lights controlled by light group to ${desiredState}")
+    
+    // For individual lights controlled by light groups, we need to be extra careful
+    // about digital events and may need to use refresh commands more frequently
+    
+    def successCount = 0
+    devices.each { device ->
+        def deviceName = device.displayName
+        def deviceId = device.id.toString()
+        
+        // Check if we're already monitoring this device
+        if (state.monitoringState.containsKey(deviceId)) {
+            logDebug("Already monitoring device ${deviceName} - skipping")
+            return
+        }
+        
+        // Check cooldown period
+        def lastCommandTime = state.lastCommandTime[deviceId] ?: 0
+        def timeSinceLastCommand = (now() - lastCommandTime) / 1000
+        
+        if (timeSinceLastCommand < cooldownPeriod) {
+            logDebug("Cannot start monitoring due to cooldown period - Device: ${deviceName}, Time since last command: ${timeSinceLastCommand.toInteger()}s")
+            return
+        }
+        
+        logInfo("Starting monitoring for individual light ${deviceName} (controlled by light group) to ${desiredState}")
+        
+        // Get current state
+        def currentValue = null
+        try {
+            currentValue = device.currentValue("switch")
+            logDebug("Current device state: ${currentValue}")
+        } catch (Exception e) {
+            logError("Error getting current state for device ${deviceName}: ${e.message}")
+        }
+        
+        // Set up monitoring for this device with special flag for group-controlled lights
+        state.monitoringState[deviceId] = [
+            desiredState: desiredState,
+            checkCount: 0,
+            refreshCount: 0,
+            lastCommand: desiredState,
+            lastCheck: now(),
+            startTime: now(),
+            initialState: currentValue,
+            deviceName: deviceName,
+            waitingForRefresh: false,
+            refreshSent: false,
+            externalEvent: false,
+            groupControlled: true // Flag to indicate this light is controlled by a group
+        ]
+        
+        logDebug("Monitoring state initialized for group-controlled light: ${state.monitoringState[deviceId]}")
+        
+        // For group-controlled lights, we might not need to send a direct command
+        // since the light group should handle that. Instead, we'll just start monitoring
+        // and let the refresh process check the actual state
+        
+        // Schedule initial check
+        logDebug("Scheduling initial check for group-controlled light ${deviceName} in ${checkInterval} seconds")
+        runIn(checkInterval, "startRefreshProcess", [data: [deviceId: deviceId]])
+        
+        // Set up timeout check
+        logDebug("Setting up timeout check for group-controlled light ${deviceName} in ${commandTimeout} seconds")
+        runIn(commandTimeout, "timeoutCheck", [data: [deviceId: deviceId]])
+        
+        successCount++
+    }
+    
+    logInfo("Successfully started monitoring for ${successCount} out of ${devices.size()} individual lights controlled by light group")
+    return successCount > 0
+}
+
+// Function to check individual lights that are controlled by light groups
+def checkIndividualLightsControlledByGroup(devices) {
+    if (!devices || devices.size() == 0) {
+        logError("checkIndividualLightsControlledByGroup called with no devices")
+        return [:]
+    }
+    
+    logInfo("Checking status for ${devices.size()} individual lights controlled by light group")
+    
+    def results = [:]
+    def allOff = true
+    
+    devices.each { device ->
+        def status = checkLightStatusOnly(device)
+        def isOff = (status == "off")
+        results[device.displayName] = [status: status, isOff: isOff]
+        
+        if (!isOff) {
+            allOff = false
+        }
+    }
+    
+    logInfo("Individual lights controlled by group check results: ${results}")
+    logInfo("All lights off: ${allOff}")
+    
+    return [results: results, allOff: allOff]
 }
