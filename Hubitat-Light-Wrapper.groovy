@@ -16,7 +16,7 @@
  *  1.06 - Fixed infinite loop issue where app was monitoring its own refresh commands by filtering out digital events and adding recent command detection
  *  1.07 - Event handler now only ignores events within 10 seconds of the wrapper's own command, monitors all other events (including digital/app-command/mesh), and enhanced debug logging for event diagnosis
  *  1.08 - Added force-clear logic: if a device is already being monitored when a new event is received, the app forcefully clears its monitoring state, logs an error, and proceeds to monitor the new event. This ensures the app always monitors the latest event for each device and never gets stuck on an old state
- *
+ *  1.09 - Added notification when monitoring is abandoned due to device being unreachable (no confirmation of intended state)
  */
 
 definition(
@@ -350,6 +350,12 @@ def startRefreshProcess(data) {
         // Check if we should continue attempting to send commands or remove from monitoring
         if (monitorData.checkCount >= maxRetries / 2) {
             logWarn("MONITORING ABANDONED - Could not access device ${deviceName} after multiple attempts")
+            if (sendPushNotification && notificationDevices) {
+                logDebug("Sending unreachable/abandon notification to ${notificationDevices.size()} devices")
+                notificationDevices.each {
+                    it.deviceNotification("Warning: Light ${deviceName} could not be reached and monitoring was abandoned before confirming it reached the ${monitorData.desiredState} state.")
+                }
+            }
             state.monitoringState.remove(deviceId)
             logDebug("Device ${deviceName} (ID: ${deviceId}) removed from monitoringState. New monitoringState: ${state.monitoringState}")
         } else {
@@ -426,6 +432,12 @@ def checkLightStatus(data) {
         // Check if we should continue attempting to send commands or remove from monitoring
         if (monitorData.checkCount >= maxRetries / 2) {
             logWarn("MONITORING ABANDONED - Could not access device ${deviceName} after multiple attempts")
+            if (sendPushNotification && notificationDevices) {
+                logDebug("Sending unreachable/abandon notification to ${notificationDevices.size()} devices")
+                notificationDevices.each {
+                    it.deviceNotification("Warning: Light ${deviceName} could not be reached and monitoring was abandoned before confirming it reached the ${monitorData.desiredState} state.")
+                }
+            }
             state.monitoringState.remove(deviceId)
             logDebug("Device ${deviceName} (ID: ${deviceId}) removed from monitoringState. New monitoringState: ${state.monitoringState}")
         } else {
