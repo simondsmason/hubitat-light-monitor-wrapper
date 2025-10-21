@@ -17,6 +17,11 @@
  *  1.07 - Event handler now only ignores events within 10 seconds of the wrapper's own command, monitors all other events (including digital/app-command/mesh), and enhanced debug logging for event diagnosis
  *  1.08 - Added force-clear logic: if a device is already being monitored when a new event is received, the app forcefully clears its monitoring state, logs an error, and proceeds to monitor the new event. This ensures the app always monitors the latest event for each device and never gets stuck on an old state
  *  1.09 - Added notification when monitoring is abandoned due to device being unreachable (no confirmation of intended state)
+ *  1.10 - Added automatic command timeout calculation based on other monitoring settings to prevent premature timeouts and ensure consistent behavior across different configurations
+ *  1.11 - CRITICAL FIX: Implemented distrust logic for desired state results during network congestion. When refresh returns desired state, continue retrying until max attempts to prevent false positives from stale refresh results. Trust non-desired state results as successful refresh. Added enhanced debug logging for false positive detection.
+ *  1.12 - FIXED FALSE POSITIVE BUG: Fixed critical issue where app would keep sending ON commands when light was already on. Added initial state verification and improved logic to distinguish between false positives and correct states. App now properly recognizes when device is already in desired state.
+ *  1.13 - CRITICAL STUCK MONITORING FIX: Enhanced stuck monitoring detection to prevent devices from being stuck in monitoring state for extended periods. Added timeout detection, maximum monitoring duration (24 hours), inactive monitoring detection, and periodic cleanup. Improved force-clear logic to detect truly stuck states vs. active monitoring. This fixes the issue where devices could be stuck in monitoring state indefinitely without any actual monitoring activity.
+ *  1.14 - CRITICAL VERIFICATION FIX: Fixed critical bug where app would immediately exit monitoring when device reported being in desired state, bypassing all verification processes. Removed early state check that trusted potentially stale/optimistic device status. App now always proceeds through proper verification flow: Digital Event → Wait checkInterval → Refresh → Wait refreshWait → Check Status. This ensures unreliable devices are properly verified regardless of initial status report.
  */
 
 definition(
@@ -29,6 +34,9 @@ definition(
     iconX2Url: "",
     iconX3Url: ""
 )
+
+// App version
+def getVersion() { return "1.14" }
 
 preferences {
     page(name: "mainPage")
@@ -44,8 +52,8 @@ def mainPage() {
             input "checkInterval", "number", title: "Status Check Interval (seconds) (default: 30)", defaultValue: 30, required: true
             input "refreshWait", "number", title: "Wait After Refresh (seconds) (default: 30)", defaultValue: 30, required: true
             input "maxRetries", "number", title: "Maximum Retries (default: 5)", defaultValue: 5, required: true
-            input "commandTimeout", "number", title: "Command Timeout (seconds) (default: 240)", defaultValue: 240, required: true
             input "cooldownPeriod", "number", title: "Cooldown Period Between Monitoring Sessions (seconds) (default: 60)", defaultValue: 60, required: true
+            input "commandTimeout", "number", title: "Command Timeout (seconds) (auto-calculated when Done)", defaultValue: 240, required: true
         }
         
         section("Notifications") {
@@ -63,6 +71,14 @@ def mainPage() {
 }
 
 def installed() {
+    logInfo("=== INSTALLED METHOD CALLED ===")
+    
+    // Auto-calculate and set the initial command timeout
+    def calculatedTimeout = calculateRecommendedTimeout()
+    logInfo("Initial calculated timeout: ${calculatedTimeout}")
+    app.updateSetting("commandTimeout", [value: calculatedTimeout.toString(), type: "number"])
+    logInfo("Set initial command timeout to ${calculatedTimeout} seconds based on default settings")
+    
     initialize()
     if (debugMode) {
         scheduleDebugLogDisable()
@@ -70,8 +86,26 @@ def installed() {
 }
 
 def updated() {
+    logInfo("=== UPDATED METHOD CALLED ===")
+    logInfo("Current settings - checkInterval: ${checkInterval}, refreshWait: ${refreshWait}, maxRetries: ${maxRetries}")
+    logInfo("Current commandTimeout: ${commandTimeout}")
+    
     unsubscribe()
     unschedule()
+    
+    // Auto-calculate and update the command timeout based on other settings
+    def calculatedTimeout = calculateRecommendedTimeout()
+    logInfo("Calculated timeout: ${calculatedTimeout}")
+    logInfo("Timeout values match? ${commandTimeout == calculatedTimeout}")
+    
+    if (commandTimeout != calculatedTimeout) {
+        logInfo("Updating timeout from ${commandTimeout} to ${calculatedTimeout}")
+        app.updateSetting("commandTimeout", [value: calculatedTimeout.toString(), type: "number"])
+        logInfo("Auto-updated command timeout from ${commandTimeout} to ${calculatedTimeout} seconds based on current settings")
+    } else {
+        logInfo("Timeout already correct, no update needed")
+    }
+    
     initialize()
     if (debugMode) {
         scheduleDebugLogDisable()
@@ -90,12 +124,31 @@ def initialize() {
     logInfo("Light Monitor initialized with ${lightSwitches.size()} light switches")
     if (debugMode) logDebug("Debug logging enabled")
     
+    // Schedule periodic stuck monitoring cleanup (every hour)
+    schedule("0 0 * * * ?", periodicCleanupStuckMonitoring)
+    
     // Log all configured devices for verification
     if (debugMode) {
         lightSwitches.each { device ->
             logDebug("Configured device: ID=${device.id}, Name=${device.displayName}")
         }
     }
+}
+
+def calculateRecommendedTimeout() {
+    // Calculate timeout based on other settings: (checkInterval + refreshWait) * (maxRetries + 1) + buffer
+    def baseTime = (checkInterval + refreshWait) * (maxRetries + 1)
+    def buffer = 60 // Extra time for processing and device response
+    def calculatedTimeout = baseTime + buffer
+    
+    logInfo("=== TIMEOUT CALCULATION DEBUG ===")
+    logInfo("checkInterval: ${checkInterval}, refreshWait: ${refreshWait}, maxRetries: ${maxRetries}")
+    logInfo("Base calculation: (${checkInterval} + ${refreshWait}) * (${maxRetries} + 1) = ${baseTime}")
+    logInfo("Buffer: ${buffer}")
+    logInfo("Final calculated timeout: ${calculatedTimeout} seconds")
+    logInfo("=== END TIMEOUT CALCULATION ===")
+    
+    return calculatedTimeout
 }
 
 def scheduleDebugLogDisable() {
@@ -112,20 +165,20 @@ def disableDebugLog() {
 
 def logDebug(msg) {
     if (debugMode) {
-        log.debug "${app.name}: ${msg}"
+        log.debug "Light Monitor App: ${msg}"
     }
 }
 
 def logInfo(msg) {
-    log.info "${app.name}: ${msg}"
+    log.info "Light Monitor App: ${msg}"
 }
 
 def logWarn(msg) {
-    log.warn "${app.name}: ${msg}"
+    log.warn "Light Monitor App: ${msg}"
 }
 
 def logError(msg) {
-    log.error "${app.name}: ${msg}"
+    log.error "Light Monitor App: ${msg}"
 }
 
 def lightSwitchHandler(evt) {
@@ -141,12 +194,37 @@ def lightSwitchHandler(evt) {
     def deviceName = evt.displayName
     def newState = evt.value
 
-    // FORCE-CLEAR LOGIC: If device is already being monitored, clear it and log error
+    // ENHANCED STUCK MONITORING DETECTION: Check for stuck monitoring states
     if (state.monitoringState.containsKey(deviceId)) {
-        logError("Device ${deviceName} (ID: ${deviceId}) was stuck in monitoringState. Forcibly clearing before starting new monitoring cycle.")
-        state.monitoringState.remove(deviceId)
-        if (state.monitoringState.containsKey(deviceId)) {
-            logError("Device ${deviceName} (ID: ${deviceId}) could not be removed from monitoringState. Manual intervention may be required.")
+        def monitorData = state.monitoringState[deviceId]
+        def timeSinceLastActivity = now() - monitorData.lastCheck
+        def timeSinceStart = now() - monitorData.startTime
+        def maxMonitoringDuration = 24 * 60 * 60 * 1000 // 24 hours in milliseconds
+        
+        // Debug logging for stuck monitoring detection
+        logDebug("Checking for stuck monitoring state for ${deviceName}:")
+        logDebug("  - Time since last activity: ${timeSinceLastActivity/1000}s (timeout threshold: ${commandTimeout * 2}s)")
+        logDebug("  - Time since start: ${timeSinceStart/1000}s (duration threshold: ${maxMonitoringDuration/1000}s)")
+        logDebug("  - Check count: ${monitorData.checkCount}, Refresh count: ${monitorData.refreshCount}")
+        logDebug("  - Desired state: ${monitorData.desiredState}, Current monitoring state: ${monitorData}")
+        
+        // Check for truly stuck monitoring (no activity for extended period)
+        def isStuckByTimeout = timeSinceLastActivity > (commandTimeout * 1000 * 2) // 2x command timeout
+        def isStuckByDuration = timeSinceStart > maxMonitoringDuration
+        def hasNoActivity = monitorData.checkCount == 0 && monitorData.refreshCount == 0
+        
+        logDebug("Stuck detection results - Timeout: ${isStuckByTimeout}, Duration: ${isStuckByDuration}, No Activity: ${hasNoActivity}")
+        
+        if (isStuckByTimeout || isStuckByDuration || hasNoActivity) {
+            logWarn("Device ${deviceName} (ID: ${deviceId}) was stuck in monitoringState - clearing before starting new monitoring cycle")
+            logWarn("Stuck reasons - Timeout: ${isStuckByTimeout} (${timeSinceLastActivity/1000}s), Duration: ${isStuckByDuration} (${timeSinceStart/1000}s), No Activity: ${hasNoActivity}")
+            state.monitoringState.remove(deviceId)
+            if (state.monitoringState.containsKey(deviceId)) {
+                logError("Device ${deviceName} (ID: ${deviceId}) could not be removed from monitoringState. Manual intervention may be required.")
+            }
+        } else {
+            logDebug("Device ${deviceName} (ID: ${deviceId}) is actively being monitored - ignoring new event due to cooldown")
+            return
         }
     }
     
@@ -230,7 +308,7 @@ def lightSwitchHandler(evt) {
     }
     
     // Always log when monitoring starts, regardless of debug mode
-    log.info "${app.name}: MONITORING STARTED - Light ${deviceName} (ID: ${deviceId}) changing to ${newState} at ${new Date().format('yyyy-MM-dd HH:mm:ss')}"
+    log.info "Light Monitor App: MONITORING STARTED - Light ${deviceName} (ID: ${deviceId}) changing to ${newState} at ${new Date().format('yyyy-MM-dd HH:mm:ss')}"
     logDebug("Adding device ${deviceName} (ID: ${deviceId}) to monitoringState.")
     
     // Verify the device exists in our list - first with direct check
@@ -284,6 +362,10 @@ def lightSwitchHandler(evt) {
     } catch (Exception e) {
         logError("Error getting current state for device ${deviceName}: ${e.message}")
     }
+    
+    // Always proceed with monitoring regardless of initial state check
+    // The initial state check may be stale/optimistic - we need to verify through refresh process
+    logDebug("Initial state check shows ${currentValue}, but proceeding with verification process to ensure accuracy")
     
     // Set up monitoring for this device
     state.monitoringState[deviceId] = [
@@ -479,14 +561,55 @@ def checkLightStatus(data) {
     monitorData.lastCheck = now()
     state.monitoringState[deviceId] = monitorData
     
-    // Check if we've reached the desired state
+    // FIXED LOGIC: Improved false positive detection
+    // Only distrust desired state results if we haven't sent our own command yet
+    // or if we've sent multiple commands and still getting the same result
     if (currentState == desiredState) {
-        // Success! Light is in desired state
-        logInfo("MONITORING COMPLETED - Light ${deviceName} successfully changed to ${desiredState} after ${elapsedTime.toInteger()} seconds and ${monitorData.checkCount} retries")
-        logDebug("Removing monitoring state for device ${deviceName}")
-        state.monitoringState.remove(deviceId)
-        logDebug("Device ${deviceName} (ID: ${deviceId}) removed from monitoringState. New monitoringState: ${state.monitoringState}")
+        // Check if we've sent commands to this device during monitoring
+        def hasSentCommands = monitorData.checkCount > 0
+        
+        // If we haven't sent commands yet, this is likely a false positive from stale state
+        if (!hasSentCommands) {
+            logInfo("POTENTIAL FALSE POSITIVE - Light ${deviceName} reports ${desiredState} but no commands sent yet - continuing verification (attempt ${monitorData.checkCount + 1}/${maxRetries})")
+            logDebug("Initial state check may be stale - sending command to verify actual state")
+            
+            // Increment retry count and send command
+            monitorData.checkCount = monitorData.checkCount + 1
+            state.monitoringState[deviceId] = monitorData
+            
+            // Send the command to verify the actual state
+            try {
+                if (desiredState == "on") {
+                    logDebug("Sending verification ON command to device ${deviceName}")
+                    device.on()
+                } else {
+                    logDebug("Sending verification OFF command to device ${deviceName}")
+                    device.off()
+                }
+                
+                // Track the command time for cooldown
+                state.lastCommandTime[deviceId] = now()
+                logDebug("Updated last command time for device ${deviceName}")
+                
+            } catch (Exception e) {
+                logError("Error sending verification command to device ${deviceName}: ${e.message}")
+            }
+            
+            // Schedule next check with refresh after the checkInterval
+            logDebug("Scheduling next refresh and check for device ${deviceName} in ${checkInterval} seconds")
+            runIn(checkInterval, "startRefreshProcess", [data: [deviceId: deviceId]])
+        } else {
+            // We've sent commands and the device is in the desired state - this is success
+            logInfo("MONITORING COMPLETED - Light ${deviceName} successfully changed to ${desiredState} after ${elapsedTime.toInteger()} seconds and ${monitorData.checkCount} commands (verified through refresh)")
+            logDebug("Removing monitoring state for device ${deviceName}")
+            state.monitoringState.remove(deviceId)
+            logDebug("Device ${deviceName} (ID: ${deviceId}) removed from monitoringState. New monitoringState: ${state.monitoringState}")
+        }
     } else {
+        // We got an unexpected state - this means the refresh worked and we can trust this result
+        logInfo("REFRESH SUCCESS - Light ${deviceName} reports ${currentState} (expected ${desiredState}) - refresh command worked, proceeding to correct")
+        logDebug("Non-desired state result indicates successful refresh - network congestion resolved")
+        
         // Check if we've reached max retries
         if (monitorData.checkCount >= maxRetries) {
             logWarn("MONITORING FAILED - Light ${deviceName} failed to change to ${desiredState} after ${maxRetries} attempts and ${elapsedTime.toInteger()} seconds")
@@ -509,11 +632,11 @@ def checkLightStatus(data) {
             state.monitoringState.remove(deviceId)
             logDebug("Device ${deviceName} (ID: ${deviceId}) removed from monitoringState. New monitoringState: ${state.monitoringState}")
         } else {
-            // Increment retry count and try again
+            // Increment retry count and try again - we know the refresh worked so this is a real discrepancy
             monitorData.checkCount = monitorData.checkCount + 1
             state.monitoringState[deviceId] = monitorData
             
-            logInfo("Light ${deviceName} not in desired state (${desiredState}). Current state: ${currentState ?: 'Unknown'}. Retry attempt ${monitorData.checkCount}")
+            logInfo("Light ${deviceName} not in desired state (${desiredState}). Current state: ${currentState ?: 'Unknown'}. Retry attempt ${monitorData.checkCount} (refresh confirmed working)")
             
             // Send the command again
             try {
@@ -691,7 +814,29 @@ def startMonitoring(device, desiredState) {
 // Function to manually clear stuck monitoring states
 def clearStuckMonitoring() {
     logInfo("Attempting to clear stuck monitoring states...")
-    def stuckDevices = state.monitoringState.findAll { it.value.waitingForRefresh || it.value.refreshSent }
+    def currentTime = now()
+    def maxMonitoringDuration = 24 * 60 * 60 * 1000 // 24 hours in milliseconds
+    def stuckDevices = [:]
+    
+    // Check all monitoring states for stuck conditions
+    state.monitoringState.each { deviceId, monitorData ->
+        def deviceName = monitorData.deviceName ?: "Unknown Device"
+        def timeSinceLastActivity = currentTime - monitorData.lastCheck
+        def timeSinceStart = currentTime - monitorData.startTime
+        def maxTimeout = commandTimeout * 1000 * 3 // 3x command timeout for safety
+        
+        // Check for various stuck conditions
+        def isWaitingStuck = monitorData.waitingForRefresh || monitorData.refreshSent
+        def isTimeoutStuck = timeSinceLastActivity > maxTimeout
+        def isDurationStuck = timeSinceStart > maxMonitoringDuration
+        def isInactiveStuck = monitorData.checkCount == 0 && monitorData.refreshCount == 0 && timeSinceStart > (checkInterval * 1000 * 3)
+        
+        if (isWaitingStuck || isTimeoutStuck || isDurationStuck || isInactiveStuck) {
+            stuckDevices[deviceId] = monitorData
+            logWarn("Found stuck device: ${deviceName} - Waiting: ${isWaitingStuck}, Timeout: ${isTimeoutStuck} (${timeSinceLastActivity/1000}s), Duration: ${isDurationStuck} (${timeSinceStart/1000}s), Inactive: ${isInactiveStuck}")
+        }
+    }
+    
     if (stuckDevices.size() > 0) {
         logWarn("Found ${stuckDevices.size()} devices in a stuck state. Attempting to clear them.")
         stuckDevices.each { deviceId, monitorData ->
@@ -1044,4 +1189,111 @@ def checkIndividualLightsControlledByGroup(devices) {
     logInfo("All lights off: ${allOff}")
     
     return [results: results, allOff: allOff]
+}
+
+// Function to periodically clean up stuck monitoring states
+def periodicCleanupStuckMonitoring() {
+    logInfo("Running periodic stuck monitoring cleanup...")
+    def currentTime = now()
+    def maxMonitoringDuration = 24 * 60 * 60 * 1000 // 24 hours in milliseconds
+    def cleanedCount = 0
+    def totalDevices = state.monitoringState.size()
+    
+    logDebug("Periodic cleanup starting - checking ${totalDevices} devices in monitoring state")
+    
+    // Check all monitoring states for stuck conditions
+    def devicesToRemove = []
+    state.monitoringState.each { deviceId, monitorData ->
+        def deviceName = monitorData.deviceName ?: "Unknown Device"
+        def timeSinceLastActivity = currentTime - monitorData.lastCheck
+        def timeSinceStart = currentTime - monitorData.startTime
+        def maxTimeout = commandTimeout * 1000 * 3 // 3x command timeout for safety
+        
+        logDebug("Checking device ${deviceName} (ID: ${deviceId}):")
+        logDebug("  - Time since last activity: ${timeSinceLastActivity/1000}s (threshold: ${maxTimeout/1000}s)")
+        logDebug("  - Time since start: ${timeSinceStart/1000}s (threshold: ${maxMonitoringDuration/1000}s)")
+        logDebug("  - Check count: ${monitorData.checkCount}, Refresh count: ${monitorData.refreshCount}")
+        logDebug("  - Desired state: ${monitorData.desiredState}, Waiting for refresh: ${monitorData.waitingForRefresh}")
+        
+        // Check for stuck conditions
+        def isTimeoutStuck = timeSinceLastActivity > maxTimeout
+        def isDurationStuck = timeSinceStart > maxMonitoringDuration
+        def isInactiveStuck = monitorData.checkCount == 0 && monitorData.refreshCount == 0 && timeSinceStart > (checkInterval * 1000 * 6)
+        
+        logDebug("Stuck conditions - Timeout: ${isTimeoutStuck}, Duration: ${isDurationStuck}, Inactive: ${isInactiveStuck}")
+        
+        if (isTimeoutStuck || isDurationStuck || isInactiveStuck) {
+            devicesToRemove.add(deviceId)
+            logWarn("Periodic cleanup removing stuck device: ${deviceName} - Timeout: ${isTimeoutStuck} (${timeSinceLastActivity/1000}s), Duration: ${isDurationStuck} (${timeSinceStart/1000}s), Inactive: ${isInactiveStuck}")
+        }
+    }
+    
+    // Remove stuck devices
+    devicesToRemove.each { deviceId ->
+        def monitorData = state.monitoringState[deviceId]
+        def deviceName = monitorData?.deviceName ?: "Unknown Device"
+        state.monitoringState.remove(deviceId)
+        logInfo("Periodic cleanup removed stuck monitoring state for device ${deviceName} (ID: ${deviceId})")
+        cleanedCount++
+    }
+    
+    if (cleanedCount > 0) {
+        logInfo("Periodic cleanup completed - removed ${cleanedCount} stuck monitoring states out of ${totalDevices} total devices")
+    } else {
+        logInfo("Periodic cleanup completed - found no stuck monitoring states out of ${totalDevices} total devices")
+    }
+}
+
+// Function to get detailed monitoring status for debugging
+def getDetailedMonitoringStatus() {
+    logInfo("=== DETAILED MONITORING STATUS ===")
+    def currentTime = now()
+    def maxMonitoringDuration = 24 * 60 * 60 * 1000 // 24 hours in milliseconds
+    def maxTimeout = commandTimeout * 1000 * 3 // 3x command timeout for safety
+    
+    if (!state.monitoringState || state.monitoringState.size() == 0) {
+        logInfo("No devices currently in monitoring state")
+        return
+    }
+    
+    logInfo("Total devices in monitoring state: ${state.monitoringState.size()}")
+    logInfo("Current time: ${new Date(currentTime).format('yyyy-MM-dd HH:mm:ss')}")
+    logInfo("Timeout threshold: ${maxTimeout/1000} seconds")
+    logInfo("Duration threshold: ${maxMonitoringDuration/1000} seconds")
+    
+    state.monitoringState.each { deviceId, monitorData ->
+        def deviceName = monitorData.deviceName ?: "Unknown Device"
+        def timeSinceLastActivity = currentTime - monitorData.lastCheck
+        def timeSinceStart = currentTime - monitorData.startTime
+        
+        logInfo("Device: ${deviceName} (ID: ${deviceId})")
+        logInfo("  - Desired state: ${monitorData.desiredState}")
+        logInfo("  - Check count: ${monitorData.checkCount}, Refresh count: ${monitorData.refreshCount}")
+        logInfo("  - Time since last activity: ${timeSinceLastActivity/1000} seconds")
+        logInfo("  - Time since start: ${timeSinceStart/1000} seconds")
+        logInfo("  - Start time: ${new Date(monitorData.startTime).format('yyyy-MM-dd HH:mm:ss')}")
+        logInfo("  - Last check time: ${new Date(monitorData.lastCheck).format('yyyy-MM-dd HH:mm:ss')}")
+        logInfo("  - Waiting for refresh: ${monitorData.waitingForRefresh}")
+        logInfo("  - Refresh sent: ${monitorData.refreshSent}")
+        logInfo("  - External event: ${monitorData.externalEvent}")
+        
+        // Check for stuck conditions
+        def isTimeoutStuck = timeSinceLastActivity > maxTimeout
+        def isDurationStuck = timeSinceStart > maxMonitoringDuration
+        def isInactiveStuck = monitorData.checkCount == 0 && monitorData.refreshCount == 0 && timeSinceStart > (checkInterval * 1000 * 6)
+        
+        logInfo("  - Stuck conditions:")
+        logInfo("    * Timeout stuck: ${isTimeoutStuck} (${timeSinceLastActivity/1000}s > ${maxTimeout/1000}s)")
+        logInfo("    * Duration stuck: ${isDurationStuck} (${timeSinceStart/1000}s > ${maxMonitoringDuration/1000}s)")
+        logInfo("    * Inactive stuck: ${isInactiveStuck} (no activity for ${timeSinceStart/1000}s)")
+        
+        if (isTimeoutStuck || isDurationStuck || isInactiveStuck) {
+            logWarn("  *** DEVICE IS STUCK IN MONITORING STATE ***")
+        } else {
+            logInfo("  - Device appears to be actively monitored")
+        }
+        logInfo("  - Full monitoring data: ${monitorData}")
+        logInfo("---")
+    }
+    logInfo("=== END DETAILED MONITORING STATUS ===")
 }
