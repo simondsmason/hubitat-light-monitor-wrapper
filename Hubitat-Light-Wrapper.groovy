@@ -22,6 +22,7 @@
  *  1.12 - FIXED FALSE POSITIVE BUG: Fixed critical issue where app would keep sending ON commands when light was already on. Added initial state verification and improved logic to distinguish between false positives and correct states. App now properly recognizes when device is already in desired state.
  *  1.13 - CRITICAL STUCK MONITORING FIX: Enhanced stuck monitoring detection to prevent devices from being stuck in monitoring state for extended periods. Added timeout detection, maximum monitoring duration (24 hours), inactive monitoring detection, and periodic cleanup. Improved force-clear logic to detect truly stuck states vs. active monitoring. This fixes the issue where devices could be stuck in monitoring state indefinitely without any actual monitoring activity.
  *  1.14 - CRITICAL VERIFICATION FIX: Fixed critical bug where app would immediately exit monitoring when device reported being in desired state, bypassing all verification processes. Removed early state check that trusted potentially stale/optimistic device status. App now always proceeds through proper verification flow: Digital Event → Wait checkInterval → Refresh → Wait refreshWait → Check Status. This ensures unreliable devices are properly verified regardless of initial status report.
+ *  1.15 - CRITICAL STUCK DETECTION FIX: Fixed stuck monitoring detection to respect checkInterval timing. App was immediately clearing monitoring state before even starting the first check. Added minimum monitoring time requirement (3x checkInterval) before considering device inactive. Also fixed false positive logic to trust correct states immediately instead of sending unnecessary verification commands, reducing monitoring time from 180s to 90s for lights already in desired state.
  */
 
 definition(
@@ -36,7 +37,7 @@ definition(
 )
 
 // App version
-def getVersion() { return "1.14" }
+def getVersion() { return "1.15" }
 
 preferences {
     page(name: "mainPage")
@@ -49,11 +50,11 @@ def mainPage() {
         }
         
         section("Monitoring Settings") {
-            input "checkInterval", "number", title: "Status Check Interval (seconds) (default: 30)", defaultValue: 30, required: true
-            input "refreshWait", "number", title: "Wait After Refresh (seconds) (default: 30)", defaultValue: 30, required: true
-            input "maxRetries", "number", title: "Maximum Retries (default: 5)", defaultValue: 5, required: true
-            input "cooldownPeriod", "number", title: "Cooldown Period Between Monitoring Sessions (seconds) (default: 60)", defaultValue: 60, required: true
-            input "commandTimeout", "number", title: "Command Timeout (seconds) (auto-calculated when Done)", defaultValue: 240, required: true
+            input "checkInterval", "number", title: "Initial Wait Before First Check (seconds) - Time to wait before sending first refresh command (default: 30)", defaultValue: 30, required: true
+            input "refreshWait", "number", title: "Wait After Refresh Command (seconds) - Time to wait after refresh before checking device state (default: 30)", defaultValue: 30, required: true
+            input "maxRetries", "number", title: "Maximum Retry Attempts - How many times to retry if device doesn't reach desired state (default: 5)", defaultValue: 5, required: true
+            input "cooldownPeriod", "number", title: "Cooldown Between Monitoring Sessions (seconds) - Minimum time between monitoring the same device (default: 60)", defaultValue: 60, required: true
+            input "commandTimeout", "number", title: "Maximum Monitoring Duration (seconds) - Auto-calculated total timeout for monitoring session", defaultValue: 240, required: true
         }
         
         section("Notifications") {
@@ -205,13 +206,15 @@ def lightSwitchHandler(evt) {
         logDebug("Checking for stuck monitoring state for ${deviceName}:")
         logDebug("  - Time since last activity: ${timeSinceLastActivity/1000}s (timeout threshold: ${commandTimeout * 2}s)")
         logDebug("  - Time since start: ${timeSinceStart/1000}s (duration threshold: ${maxMonitoringDuration/1000}s)")
+        logDebug("  - Minimum monitoring time: ${minimumMonitoringTime/1000}s")
         logDebug("  - Check count: ${monitorData.checkCount}, Refresh count: ${monitorData.refreshCount}")
         logDebug("  - Desired state: ${monitorData.desiredState}, Current monitoring state: ${monitorData}")
         
         // Check for truly stuck monitoring (no activity for extended period)
         def isStuckByTimeout = timeSinceLastActivity > (commandTimeout * 1000 * 2) // 2x command timeout
         def isStuckByDuration = timeSinceStart > maxMonitoringDuration
-        def hasNoActivity = monitorData.checkCount == 0 && monitorData.refreshCount == 0
+        def minimumMonitoringTime = checkInterval * 1000 * 3 // Must monitor for at least 3 check intervals
+        def hasNoActivity = monitorData.checkCount == 0 && monitorData.refreshCount == 0 && timeSinceStart > minimumMonitoringTime
         
         logDebug("Stuck detection results - Timeout: ${isStuckByTimeout}, Duration: ${isStuckByDuration}, No Activity: ${hasNoActivity}")
         
@@ -561,50 +564,13 @@ def checkLightStatus(data) {
     monitorData.lastCheck = now()
     state.monitoringState[deviceId] = monitorData
     
-    // FIXED LOGIC: Improved false positive detection
-    // Only distrust desired state results if we haven't sent our own command yet
-    // or if we've sent multiple commands and still getting the same result
+    // FIXED LOGIC: Only distrust incorrect states, trust correct states immediately
     if (currentState == desiredState) {
-        // Check if we've sent commands to this device during monitoring
-        def hasSentCommands = monitorData.checkCount > 0
-        
-        // If we haven't sent commands yet, this is likely a false positive from stale state
-        if (!hasSentCommands) {
-            logInfo("POTENTIAL FALSE POSITIVE - Light ${deviceName} reports ${desiredState} but no commands sent yet - continuing verification (attempt ${monitorData.checkCount + 1}/${maxRetries})")
-            logDebug("Initial state check may be stale - sending command to verify actual state")
-            
-            // Increment retry count and send command
-            monitorData.checkCount = monitorData.checkCount + 1
-            state.monitoringState[deviceId] = monitorData
-            
-            // Send the command to verify the actual state
-            try {
-                if (desiredState == "on") {
-                    logDebug("Sending verification ON command to device ${deviceName}")
-                    device.on()
-                } else {
-                    logDebug("Sending verification OFF command to device ${deviceName}")
-                    device.off()
-                }
-                
-                // Track the command time for cooldown
-                state.lastCommandTime[deviceId] = now()
-                logDebug("Updated last command time for device ${deviceName}")
-                
-            } catch (Exception e) {
-                logError("Error sending verification command to device ${deviceName}: ${e.message}")
-            }
-            
-            // Schedule next check with refresh after the checkInterval
-            logDebug("Scheduling next refresh and check for device ${deviceName} in ${checkInterval} seconds")
-            runIn(checkInterval, "startRefreshProcess", [data: [deviceId: deviceId]])
-        } else {
-            // We've sent commands and the device is in the desired state - this is success
-            logInfo("MONITORING COMPLETED - Light ${deviceName} successfully changed to ${desiredState} after ${elapsedTime.toInteger()} seconds and ${monitorData.checkCount} commands (verified through refresh)")
-            logDebug("Removing monitoring state for device ${deviceName}")
-            state.monitoringState.remove(deviceId)
-            logDebug("Device ${deviceName} (ID: ${deviceId}) removed from monitoringState. New monitoringState: ${state.monitoringState}")
-        }
+        // Device is in the desired state - monitoring completed successfully
+        logInfo("MONITORING COMPLETED - Light ${deviceName} successfully changed to ${desiredState} after ${elapsedTime.toInteger()} seconds and ${monitorData.checkCount} commands (verified through refresh)")
+        logDebug("Removing monitoring state for device ${deviceName}")
+        state.monitoringState.remove(deviceId)
+        logDebug("Device ${deviceName} (ID: ${deviceId}) removed from monitoringState. New monitoringState: ${state.monitoringState}")
     } else {
         // We got an unexpected state - this means the refresh worked and we can trust this result
         logInfo("REFRESH SUCCESS - Light ${deviceName} reports ${currentState} (expected ${desiredState}) - refresh command worked, proceeding to correct")
