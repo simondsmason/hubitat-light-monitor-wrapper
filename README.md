@@ -79,6 +79,7 @@ The default settings are optimized for environments with connectivity issues:
 
 ## Change History
 
+- **1.09** - 2026-03-17 - Consolidate instruction files into CLAUDE.md
 - **1.00** - Initial release
 - **1.01** - Added refresh capability to ensure accurate state reporting before comparing states
 - **1.02** - Fixed retry loop issue where app would monitor events from other sources and get stuck in infinite retry cycles
